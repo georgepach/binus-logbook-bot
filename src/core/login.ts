@@ -162,8 +162,9 @@ class LoginBot {
       await this.handleStaySignedIn();
       
       return true;
-      
+
     } catch (error) {
+      console.error('❌ Login error:', error instanceof Error ? error.message : error);
       return false;
     }
   }

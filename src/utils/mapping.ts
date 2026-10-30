@@ -45,6 +45,23 @@ export function getSemesterCode(semesterEnv: string): string {
 }
 
 /**
+ * Month number mapping from environment variable to month number (1-12)
+ */
+export const MONTH_NUMBER: { [key: string]: number } = {
+  'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
+  'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12
+};
+
+/**
+ * Get the month number from environment variable
+ * @param monthEnv - The month environment variable (e.g., 'SEP', 'OCT')
+ * @returns The month number (e.g., 9 for 'SEP')
+ */
+export function getMonthNumber(monthEnv: string): number {
+  return MONTH_NUMBER[monthEnv] || 9;
+}
+
+/**
  * Get the email from environment variable
  * @returns The email address from environment variable
  */

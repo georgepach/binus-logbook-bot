@@ -1,6 +1,7 @@
-import { Page } from 'playwright';
+import { Page, Response } from 'playwright';
 import { BOT_LOCATORS } from '../constant/locator.js';
-import { ActivityData, BotConfig, BotState } from '../types/bot.js';
+import { ActivityData, BotConfig, BotState, LogBookEntry, LogBookSavePayload } from '../types/bot.js';
+import { EMPTY_ID, saveLogBookEntry } from './api.js';
 import XLSX from 'xlsx';
 
 class ActivityBot {
@@ -8,6 +9,9 @@ class ActivityBot {
   private config: BotConfig;
   private state: BotState;
   private excelData: ActivityData[] = [];
+  // Logbook entries captured from the LMS list response, keyed by date (YYYY-MM-DD)
+  private logBookEntries = new Map<string, LogBookEntry>();
+  private listIsPaged = false;
 
   constructor(page: Page, config: BotConfig) {
     this.page = page;
@@ -16,8 +20,23 @@ class ActivityBot {
       currentRow: 0,
       totalRows: 0,
       processedDates: [],
+      skippedDates: [],
       errors: []
     };
+  }
+
+  /**
+   * Convert an Excel date cell (serial number or YYYY-MM-DD text) to YYYY-MM-DD
+   */
+  private parseExcelDate(value: unknown): string | null {
+    if (typeof value === 'number') {
+      const parsed = XLSX.SSF.parse_date_code(value);
+      if (!parsed) return null;
+      return `${parsed.y}-${String(parsed.m).padStart(2, '0')}-${String(parsed.d).padStart(2, '0')}`;
+    }
+    const match = String(value ?? '').trim().match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+    if (!match) return null;
+    return `${match[1]}-${match[2].padStart(2, '0')}-${match[3].padStart(2, '0')}`;
   }
 
   /**
@@ -28,24 +47,34 @@ class ActivityBot {
       const workbook = XLSX.readFile(this.config.excelFilePath);
       const sheetName = workbook.SheetNames[0];
       const worksheet = workbook.Sheets[sheetName];
-      
-      // Convert to JSON with specific column mapping
-      // Activity is in column B (index 1), Description is in column C (index 2)
-      const jsonData = XLSX.utils.sheet_to_json(worksheet, { 
-        header: ['', 'activity', 'description'], // Empty string for column A, then activity and description
-        range: 1 // Skip header row (row 1), start from row 2
+
+      // Date is in column A, Activity in column B, Description in column C
+      const jsonData = XLSX.utils.sheet_to_json(worksheet, {
+        header: ['date', 'activity', 'description'],
+        range: 1, // Skip header row (row 1), start from row 2
+        raw: true // Keep dates as serial numbers to avoid timezone shifts
       });
-      
-      // Filter out any empty rows and ensure we have valid data
-      this.excelData = jsonData
-        .filter((row: any) => row.activity && row.description) // Only include rows with both activity and description
-        .map((row: any) => ({
-          activity: row.activity?.toString().trim() || '',
-          description: row.description?.toString().trim() || ''
-        })) as ActivityData[];
-      
+
+      this.excelData = [];
+      jsonData.forEach((row: any, index: number) => {
+        // Only include rows with both activity and description
+        if (!row.activity || !row.description) return;
+
+        const date = this.parseExcelDate(row.date);
+        if (!date) {
+          this.state.errors.push(`Excel row ${index + 2}: invalid or missing date in column A`);
+          return;
+        }
+
+        this.excelData.push({
+          date,
+          activity: row.activity.toString().trim(),
+          description: row.description.toString().trim()
+        });
+      });
+
       this.state.totalRows = this.excelData.length;
-      
+
       console.log(`📊 Loaded ${this.excelData.length} activities from Excel`);
     } catch (error) {
       console.error('❌ Failed to load Excel data:', error);
@@ -54,249 +83,199 @@ class ActivityBot {
   }
 
   /**
+   * Capture the logbook list ("data": [...]) the LMS loads when a month tab is opened
+   */
+  private async captureLogBookList(response: Response): Promise<void> {
+    if (!(response.headers()['content-type'] || '').includes('application/json')) return;
+
+    try {
+      const body = await response.json();
+      if (!Array.isArray(body?.data)) return;
+
+      const entries = (body.data as LogBookEntry[]).filter(entry => entry?.logBookHeaderID && entry?.date);
+      if (entries.length === 0) return;
+
+      // Server-side paging would hide entries and cause duplicates, so detect it
+      const total = body.recordsTotal ?? body.recordsFiltered;
+      if (typeof total === 'number' && total > body.data.length) {
+        this.listIsPaged = true;
+      }
+
+      entries.forEach(entry => this.logBookEntries.set(entry.date.slice(0, 10), entry));
+    } catch (error) {
+      // Not the response we are looking for
+    }
+  }
+
+  /**
+   * Get captured logbook entries for the configured month
+   */
+  private getMonthEntries(): LogBookEntry[] {
+    return [...this.logBookEntries.values()]
+      .filter(entry => Number(entry.date.slice(5, 7)) === this.config.logbookMonthNumber);
+  }
+
+  /**
    * Phase 1: Navigate to the activity page
    */
   public async navigateToActivityPage(): Promise<void> {
     try {
+      this.page.on('response', response => this.captureLogBookList(response));
+
       // Step 1: Wait for dashboard to load
       await this.page.waitForLoadState('domcontentloaded'); // Faster than networkidle
-      
+
       // Step 2: Click semester dropdown
       await this.page.waitForSelector(BOT_LOCATORS.SEMESTER_DROPDOWN, { timeout: 15000 });
       await this.page.click(BOT_LOCATORS.SEMESTER_DROPDOWN);
       await this.page.waitForTimeout(2000);
-      
+
       // Step 3: Select semester based on configuration
       const semesterSelector = `div.menu.transition div.item[data-value="${this.config.internshipSemester}"]`;
-      await this.page.waitForSelector(semesterSelector, { timeout: 5000 });
+      try {
+        await this.page.waitForSelector(semesterSelector, { timeout: 5000 });
+      } catch (error) {
+        const options = await this.page.$$eval('div.menu.transition div.item[data-value]', items =>
+          items.map(item => `${item.getAttribute('data-value')} = ${item.textContent?.trim()}`)
+        );
+        throw new Error(
+          `Semester code ${this.config.internshipSemester} not found. Set SEMESTER_CODE in .env to one of:\n   ${options.join('\n   ')}`
+        );
+      }
       await this.page.click(semesterSelector);
       await this.page.waitForTimeout(1000); // Short wait instead of full page load
-      
+
       // Step 4: Click "Go to Activity Enrichment Apps" button
       await this.page.waitForSelector(BOT_LOCATORS.ACTIVITY_BUTTON, { timeout: 10000 });
       await this.page.click(BOT_LOCATORS.ACTIVITY_BUTTON);
       await this.page.waitForTimeout(2000); // Short wait instead of full page load
-      
+
       // Step 5: Click account tile
       await this.page.waitForSelector(BOT_LOCATORS.ACCOUNT_TILE, { timeout: 10000 });
       await this.page.click(BOT_LOCATORS.ACCOUNT_TILE);
       await this.page.waitForTimeout(2000); // Short wait instead of full page load
-      
+
       // Step 6: Click Logbook tab
       await this.page.waitForSelector(BOT_LOCATORS.LOGBOOK_TAB, { timeout: 10000 });
       await this.page.click(BOT_LOCATORS.LOGBOOK_TAB);
       await this.page.waitForTimeout(2000); // Short wait instead of full page load
-      
+
       // Step 7: Click logbook month tab based on configuration
       const monthTabSelector = `a[onclick*="tabClick"][href="#"]:has-text("${this.config.logbookMonth}")`;
       await this.page.waitForSelector(monthTabSelector, { timeout: 10000 });
       await this.page.click(monthTabSelector);
-      await this.page.waitForTimeout(2000); // Short wait instead of full page load
-      
-      console.log('✅ Navigation completed');
-      
+
+      // Step 8: Wait until the logbook list for this month has been captured
+      for (let i = 0; i < 30 && this.getMonthEntries().length === 0; i++) {
+        await this.page.waitForTimeout(500);
+      }
+      if (this.getMonthEntries().length === 0) {
+        throw new Error(`Could not capture the ${this.config.logbookMonth} logbook list from the LMS`);
+      }
+
+      console.log(`✅ Navigation completed (${this.getMonthEntries().length} logbook rows found for ${this.config.logbookMonth})`);
+
     } catch (error) {
       console.error('❌ Navigation failed:', error);
       throw error;
     }
   }
 
-
   /**
-   * Click element with fallback locators
+   * Build the StudentSave payload for one Excel row
    */
-  private async clickWithFallback(selectors: string[], elementName: string): Promise<void> {
-    let clicked = false;
-    
-    for (let i = 0; i < selectors.length; i++) {
-      try {
-        // Wait for element to be visible and enabled (faster than full page load)
-        await this.page.waitForSelector(selectors[i], { 
-          timeout: 2000, // Reduced timeout for faster execution
-          state: 'visible' 
-        });
-        await this.page.click(selectors[i]);
-        clicked = true;
-        break;
-      } catch (error) {
-        // Try next selector
-      }
-    }
-    
-    if (!clicked) {
-      // Take screenshot for debugging
-      await this.page.screenshot({ path: `debug-${elementName.toLowerCase().replace(' ', '-')}-failed.png` });
-      throw new Error(`Could not find ${elementName} with any of the ${selectors.length} selectors`);
-    }
+  private buildPayload(activityData: ActivityData, headerId: string, existing?: LogBookEntry): LogBookSavePayload {
+    const isOffDay =
+      activityData.activity.toUpperCase() === 'OFF' ||
+      activityData.description.toUpperCase() === 'OFF';
+
+    const existingId = existing?.id && existing.id !== EMPTY_ID ? existing.id : EMPTY_ID;
+
+    return {
+      id: existingId,
+      logBookHeaderID: headerId,
+      date: `${activityData.date}T00:00:00`,
+      activity: isOffDay ? 'OFF' : activityData.activity,
+      clockIn: isOffDay ? 'OFF' : this.config.clockInTime.toUpperCase(),
+      clockOut: isOffDay ? 'OFF' : this.config.clockOutTime.toUpperCase(),
+      description: isOffDay ? 'OFF' : activityData.description,
+      flagjulyactive: existing?.flagjulyactive ?? false
+    };
   }
 
   /**
-   * Fill activity form for a specific row
-   */
-  private async fillActivityForm(rowIndex: number): Promise<void> {
-    try {
-      // Get activity data from Excel
-      const activityData = this.excelData[rowIndex];
-      if (!activityData) {
-        throw new Error(`No activity data found for row ${rowIndex + 1}`);
-      }
-      
-      // Fill clock in time - set value directly without triggering popup
-      await this.page.evaluate(({ selector, value }) => {
-        const element = document.querySelector(selector) as HTMLInputElement;
-        if (element) {
-          element.removeAttribute('readonly');
-          element.value = value;
-          // Trigger input event to ensure the value is properly set
-          element.dispatchEvent(new Event('input', { bubbles: true }));
-          element.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-      }, { selector: BOT_LOCATORS.CLOCK_IN_INPUT, value: this.config.clockInTime });
-      
-      // Fill clock out time - set value directly without triggering popup
-      await this.page.evaluate(({ selector, value }) => {
-        const element = document.querySelector(selector) as HTMLInputElement;
-        if (element) {
-          element.removeAttribute('readonly');
-          element.value = value;
-          // Trigger input event to ensure the value is properly set
-          element.dispatchEvent(new Event('input', { bubbles: true }));
-          element.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-      }, { selector: BOT_LOCATORS.CLOCK_OUT_INPUT, value: this.config.clockOutTime });
-      
-      // Fill activity title
-      await this.page.fill(BOT_LOCATORS.ACTIVITY_INPUT, activityData.activity);
-      
-      // Fill description
-      await this.page.fill(BOT_LOCATORS.DESCRIPTION_TEXTAREA, activityData.description);
-      
-      // Submit form with fallback locators
-      await this.clickWithFallback(BOT_LOCATORS.SUBMIT_BUTTON_FALLBACKS, 'Submit button');
-      await this.page.waitForTimeout(1500); // Reduced wait time for faster execution
-      
-      // Ensure modal is fully closed before proceeding (with shorter timeout)
-      try {
-        await this.page.waitForSelector('.fancybox-overlay', { state: 'hidden', timeout: 2000 });
-      } catch (error) {
-        // Modal might already be closed, continue
-      }
-      
-    } catch (error) {
-      console.error(`❌ Failed to fill form for row ${rowIndex + 1}:`, error);
-      throw error;
-    }
-  }
-
-  /**
-   * Handle OFF day entries (when activity or description contains "OFF")
-   */
-  private async handleOffDayEntry(): Promise<void> {
-    try {
-      // Click OFF button with fallback locators
-      await this.clickWithFallback(BOT_LOCATORS.OFF_BUTTON_FALLBACKS, 'OFF button');
-      await this.page.waitForTimeout(1000);
-      
-      // Submit form with fallback locators
-      await this.clickWithFallback(BOT_LOCATORS.SUBMIT_BUTTON_FALLBACKS, 'Submit button');
-      await this.page.waitForTimeout(1500); // Reduced wait time for faster execution
-      
-      // Ensure modal is fully closed before proceeding (with shorter timeout)
-      try {
-        await this.page.waitForSelector('.fancybox-overlay', { state: 'hidden', timeout: 2000 });
-      } catch (error) {
-        // Modal might already be closed, continue
-      }
-      
-    } catch (error) {
-      console.error('❌ Failed to handle OFF day entry:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Phase 2: Fill all activity entries
+   * Phase 2: Submit all activity entries via LogBook/StudentSave
    */
   public async fillAllActivities(): Promise<void> {
     try {
       // Load Excel data first
       await this.loadExcelData();
-      
-      // Wait for logbook table to load
-      await this.page.waitForSelector(BOT_LOCATORS.LOG_BOOK_TABLE, { timeout: 15000 });
-      
-      // Get all table rows to ensure we process them in the correct order
-      const tableRows = await this.page.locator('table#logBookTable tbody tr').all();
-      
-      this.state.totalRows = tableRows.length;
-      
-      console.log(`🔄 Processing ${tableRows.length} activities...`);
-      
-      // Process each row in order (top to bottom)
-      for (let i = 0; i < tableRows.length; i++) {
+
+      if (this.listIsPaged) {
+        throw new Error('The LMS logbook list is paged, so existing entries cannot be matched safely');
+      }
+
+      const monthEntries = this.getMonthEntries();
+      const headerIds = new Set(monthEntries.map(entry => entry.logBookHeaderID));
+      if (headerIds.size !== 1) {
+        throw new Error(`Expected one LogBookHeaderID for ${this.config.logbookMonth}, found ${headerIds.size}`);
+      }
+      const headerId = [...headerIds][0];
+
+      const rows = this.excelData.filter(row =>
+        this.config.onlyDates.length === 0 || this.config.onlyDates.includes(row.date)
+      );
+
+      console.log(`🔄 Processing ${rows.length} activities${this.config.dryRun ? ' (DRY RUN - nothing will be submitted)' : ''}...`);
+
+      const preview: object[] = [];
+
+      for (let i = 0; i < rows.length; i++) {
+        const activityData = rows[i];
+        this.state.currentRow = i + 1;
+
         try {
-          // Get the date for this row
-          const dateCell = await tableRows[i].locator(BOT_LOCATORS.DATE_COLUMN).first();
-          const dateText = await dateCell.textContent();
-          
-          if (!dateText) {
+          if (Number(activityData.date.slice(5, 7)) !== this.config.logbookMonthNumber) {
+            this.state.skippedDates.push(`${activityData.date} (not in ${this.config.logbookMonth})`);
+            preview.push({ date: activityData.date, action: 'SKIP: other month' });
             continue;
           }
-          
-          
-          // Find the action button for this specific row (either ENTRY or Edit)
-          let actionButton = null;
-          try {
-            // First try to find ENTRY button in this row
-            actionButton = await tableRows[i].locator(BOT_LOCATORS.ENTRY_BUTTON).first();
-            await actionButton.waitFor({ state: 'visible', timeout: 1000 });
-          } catch (error) {
-            try {
-              // If ENTRY button not found, try Edit button in this row
-              actionButton = await tableRows[i].locator(BOT_LOCATORS.EDIT_BUTTON).first();
-              await actionButton.waitFor({ state: 'visible', timeout: 1000 });
-            } catch (editError) {
-              continue;
-            }
+
+          const existing = this.logBookEntries.get(activityData.date);
+
+          if (!existing) {
+            console.log(`⚠️ ${activityData.date} not found in LMS list, it will be created as a new entry`);
           }
-          
-          // Click the action button for this row
-          await actionButton.click();
-          await this.page.waitForTimeout(1500); // Reduced wait time for faster execution
-          
-          // Get activity data to check for OFF values
-          const activityData = this.excelData[i];
-          const isOffDay = activityData && (
-            activityData.activity?.toUpperCase().trim() === 'OFF' || 
-            activityData.description?.toUpperCase().trim() === 'OFF'
-          );
-          
-          if (isOffDay) {
-            await this.handleOffDayEntry();
-          } else {
-            // Use the row index to get the corresponding Excel data in order
-            await this.fillActivityForm(i);
-          }
-          
-          this.state.processedDates.push(dateText.trim());
-          this.state.currentRow = i + 1;
-          
+
+          const payload = this.buildPayload(activityData, headerId, existing);
+
+          preview.push({
+            date: activityData.date,
+            action: payload.id === EMPTY_ID ? 'NEW' : 'UPDATE',
+            clockIn: payload.clockIn,
+            clockOut: payload.clockOut,
+            activity: payload.activity.slice(0, 40)
+          });
+
+          if (this.config.dryRun) continue;
+
+          const status = await saveLogBookEntry(this.page, payload);
+          console.log(`✅ ${activityData.date}: ${status}`);
+          this.state.processedDates.push(activityData.date);
+
         } catch (error) {
-          console.error(`❌ Failed to process row ${i + 1}:`, error);
-          this.state.errors.push(`Row ${i + 1}: ${error instanceof Error ? error.message : String(error)}`);
-          
-          // Try to close any open modal
-          try {
-            await this.page.keyboard.press('Escape');
-            await this.page.waitForTimeout(1000);
-          } catch (closeError) {
-            // Ignore close errors
-          }
+          console.error(`❌ Failed to process ${activityData.date}:`, error);
+          this.state.errors.push(`${activityData.date}: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
-      
-      console.log(`✅ Processed ${this.state.processedDates.length} activities`);
-      
+
+      console.table(preview);
+      if (this.config.dryRun) {
+        console.log('🧪 DRY RUN: nothing was submitted. Set DRY_RUN=false in .env to submit the rows above.');
+      } else {
+        console.log(`✅ Processed ${this.state.processedDates.length} activities`);
+      }
+
     } catch (error) {
       console.error('❌ Activity filling failed:', error);
       throw error;

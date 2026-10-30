@@ -1,7 +1,7 @@
 import LoginBot from './core/login.js';
 import ActivityBot from './core/bot.js';
 import { BotConfig } from './types/bot.js';
-import { getMonthName, getSemesterCode } from './utils/mapping.js';
+import { getMonthName, getMonthNumber, getSemesterCode } from './utils/mapping.js';
 import * as dotenv from 'dotenv';
 import * as path from 'path';
 
@@ -34,7 +34,10 @@ async function main() {
       clockOutTime: process.env.CLOCK_OUT_TIME || '17:00',
       excelFilePath: process.env.EXCEL_FILE_PATH || path.join(process.cwd(), 'src', 'data', 'monthly_activity.xlsx'),
       logbookMonth: getMonthName(logbookMonthEnv),
-      internshipSemester: getSemesterCode(internshipSemesterEnv)
+      logbookMonthNumber: getMonthNumber(logbookMonthEnv),
+      internshipSemester: process.env.SEMESTER_CODE || getSemesterCode(internshipSemesterEnv),
+      dryRun: (process.env.DRY_RUN || 'false').toLowerCase() === 'true',
+      onlyDates: (process.env.ONLY_DATES || '').split(',').map(date => date.trim()).filter(Boolean)
     };
     
     const activityBot = new ActivityBot(loginBot.getPage()!, botConfig);
@@ -51,12 +54,17 @@ async function main() {
       const errors = activityBot.getErrors();
       
       console.log(`✅ Successfully processed: ${state.processedDates.length} dates`);
-      
+
+      if (state.skippedDates.length > 0) {
+        console.log(`⏭️ Skipped: ${state.skippedDates.length}`);
+        state.skippedDates.forEach(date => console.log(`   - ${date}`));
+      }
+
       if (errors.length > 0) {
         console.log(`⚠️ Errors: ${errors.length}`);
         errors.forEach(error => console.log(`   - ${error}`));
       }
-      
+
       console.log('🎉 Bot execution completed successfully!');
       
     } catch (error) {
